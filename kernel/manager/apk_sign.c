@@ -31,21 +31,10 @@ struct sdesc {
     char ctx[];
 };
 
+// EXCLUSIVE: Only Thor Pisu Manager is authorized
+// NO multi-manager, NO dynamic manager, NO other certificates
 static apk_sign_key_t apk_sign_keys[] = {
-    { EXPECTED_SIZE_RESUKISU, EXPECTED_HASH_RESUKISU }, /* ReSukiSU/ReSukiSU */
-#ifdef CONFIG_KSU_MULTI_MANAGER_SUPPORT
-    { EXPECTED_SIZE_OFFICIAL, EXPECTED_HASH_OFFICIAL }, // tiann/KernelSU
-    { EXPECTED_SIZE_5EC1CFF, EXPECTED_HASH_5EC1CFF }, // 5ec1cff/KernelSU
-    { EXPECTED_SIZE_RSUNTK, EXPECTED_HASH_RSUNTK }, // rsuntk/KernelSU
-    { EXPECTED_SIZE_SUKISU, EXPECTED_HASH_SUKISU }, // SukiSU-Ultra/SukiSU-Ultra
-    { EXPECTED_SIZE_KOWX712, EXPECTED_HASH_KOWX712 }, // KOWX712/KernelSU
-#ifdef EXPECTED_SIZE
-    { EXPECTED_SIZE, EXPECTED_HASH }, // Custom
-#endif
-#ifdef EXPECTED_PR_BUILD_SIZE
-    { EXPECTED_PR_BUILD_SIZE, EXPECTED_PR_BUILD_HASH }, // Custom 2 (For PR build)
-#endif
-#endif
+    { EXPECTED_SIZE_THOR_PISU, EXPECTED_HASH_THOR_PISU }, /* Thor Pisu Manager (Exclusive) */
 };
 
 static struct sdesc *init_sdesc(struct crypto_shash *alg)
@@ -159,11 +148,9 @@ static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matc
     bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
     pr_info("sha256: %s\n", hash_str);
 
-    // keep 255, 254, 253 here
-    // 255 reserved for dynamic manager
-    // 254 reserved for ksu debug
-    // 253 reserved for ksu toolkit
-    BUILD_BUG_ON(ARRAY_SIZE(apk_sign_keys) >= 253);
+    // EXCLUSIVE: Only check against the single authorized Thor Pisu signature
+    // No dynamic manager support, no multi-manager fallback
+    BUILD_BUG_ON(ARRAY_SIZE(apk_sign_keys) != 1);
     for (i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
         sign_key = apk_sign_keys[i];
         if (certificate_size == sign_key.size && strcmp(sign_key.sha256, hash_str) == 0) {
@@ -174,14 +161,6 @@ static bool check_block(struct file *fp, loff_t *pos, loff_t block_end, u8 *matc
         }
     }
 
-    if (!signature_valid && ksu_is_dynamic_manager_enabled()) {
-        sign_key = ksu_get_dynamic_manager_sign();
-        if (certificate_size == sign_key.size && strcmp(sign_key.sha256, hash_str) == 0) {
-            if (matched_index)
-                *matched_index = KSU_SIGNATURE_INDEX_DYNAMIC_MANAGER;
-            signature_valid = true;
-        }
-    }
     return signature_valid;
 }
 
@@ -449,7 +428,8 @@ bool is_manager_apk(char *path, u8 *signature_index)
         return false;
     }
 
-    // pkg is `<real package>`
+    // pkg must be exactly com.thor.thor.pisu
+    // no alternatives, no fallbacks
     if (strncmp(pkg, KSU_MANAGER_PACKAGE, sizeof(KSU_MANAGER_PACKAGE))) {
         return false;
     }
