@@ -73,9 +73,10 @@ config KSU_X86_PATCH_SYSCALL_DISPATCHER
 config KSU_MULTI_MANAGER_SUPPORT
 	bool "Multi KernelSU manager support"
 	depends on KSU && !KSU_DISABLE_MANAGER
-	default y
+	default n
 	help
-		Enable multi KernelSU manager support
+		DISABLED FOR EXCLUSIVE THOR PISU MANAGER
+		This fork only supports the exclusive Thor Pisu Manager (com.thor.thor.pisu)
 
 choice
 	prompt "KernelSU Hooking Method"
