@@ -8,26 +8,22 @@ on:
         required: true
         type: string
       arch:
-        description: "target's architecture (arm64/x86_64)"
+        description: "target architecture (arm64/x86_64)"
         required: true
         type: string
-        default: 'arm64'
       ddk_release:
         description: 'DDK release version'
         required: false
         default: '20260828'
         type: string
-      expected_pr_build_size:
-        description: 'Second expected signature size (for PR builds)'
-        required: false
-        default: ''
+      thor_pisu_cert_size:
+        description: 'Thor Pisu Manager certificate DER size'
+        required: true
         type: string
-      expected_pr_build_hash:
-        description: 'Second expected signature hash (for PR builds)'
-        required: false
-        default: ''
+      thor_pisu_cert_hash:
+        description: 'Thor Pisu Manager certificate SHA-256'
+        required: true
         type: string
-
 
 jobs:
   build-kernelsu-ko:
@@ -38,139 +34,104 @@ jobs:
       options: --privileged
 
     steps:
-    - name: Checkout source code
-      uses: actions/checkout@v7
+      - name: Checkout source code
+        uses: actions/checkout@v7
 
-    - name: Add Safe Directory
-      run: |
-        git config --global --add safe.directory /__w/ReSukiSU/ReSukiSU
+      - name: Add Safe Directory
+        run: |
+          git config --global --add safe.directory /__w/ReSukiSU/ReSukiSU
 
-    - name: Build kernelsu.ko
-      if: ${{ inputs.arch == 'arm64' }}
-      env:
-        EXPECTED_PR_BUILD_SIZE: ${{ inputs.expected_pr_build_size }}
-        EXPECTED_PR_BUILD_HASH: ${{ inputs.expected_pr_build_hash }}
-      run: |
-        cd kernel
+      - name: Validate Thor Pisu inputs
+        env:
+          CERT_SIZE: ${{ inputs.thor_pisu_cert_size }}
+          CERT_HASH: ${{ inputs.thor_pisu_cert_hash }}
+        run: |
+          set -euo pipefail
+          [[ "$CERT_SIZE" =~ ^[0-9]+$ ]] || { echo "Invalid certificate size"; exit 1; }
+          [[ "$CERT_HASH" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Invalid certificate hash"; exit 1; }
+          test "$CERT_HASH" != "0000000000000000000000000000000000000000000000000000000000000000" || { echo "Zero certificate hash is forbidden"; exit 1; }
 
-        echo "=== Building kernelsu.ko for KMI: ${{ inputs.kmi }} ==="
+      - name: Build kernelsu.ko for arm64
+        if: ${{ inputs.arch == 'arm64' }}
+        env:
+          THOR_PISU_CERT_SIZE: ${{ inputs.thor_pisu_cert_size }}
+          THOR_PISU_CERT_HASH: ${{ inputs.thor_pisu_cert_hash }}
+        run: |
+          set -euo pipefail
+          cd kernel
 
-        EXTRA_ARGS=""
-        if [ -n "$EXPECTED_PR_BUILD_SIZE" ] && [ -z "$EXPECTED_PR_BUILD_HASH" ]; then
-          echo "ERROR: expected_pr_build_hash must be provided when expected_pr_build_size is set."
-          exit 1
-        fi
-        if [ -z "$EXPECTED_PR_BUILD_SIZE" ] && [ -n "$EXPECTED_PR_BUILD_HASH" ]; then
-          echo "ERROR: expected_pr_build_size must be provided when expected_pr_build_hash is set."
-          exit 1
-        fi
-        if [ -n "$EXPECTED_PR_BUILD_SIZE" ]; then
-          EXTRA_ARGS="KSU_EXPECTED_PR_BUILD_SIZE=$EXPECTED_PR_BUILD_SIZE KSU_EXPECTED_PR_BUILD_HASH=$EXPECTED_PR_BUILD_HASH"
-        fi
+          CONFIG_KSU=m           CONFIG_KSU_MULTI_MANAGER_SUPPORT=n           CONFIG_KSU_TRACEPOINT_HOOK=y           KSU_MANAGER_PACKAGE="com.thor.thor.pisu"           KSU_EXPECTED_SIZE="$THOR_PISU_CERT_SIZE"           KSU_EXPECTED_HASH="$THOR_PISU_CERT_HASH"           CC=clang make
 
-        CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang make $EXTRA_ARGS
-        
-        echo "=== Build completed ==="
-        # Create output directory in GitHub workspace
-        OUT_DIR=/github/workspace/out/aarch64
-        mkdir -p $OUT_DIR
+          test -f kernelsu.ko
+          OUT_DIR=/github/workspace/out/aarch64
+          mkdir -p "$OUT_DIR"
+          OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
+          cp kernelsu.ko "$OUT_DIR/$OUTPUT_NAME"
+          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
+          test -s "$OUT_DIR/$OUTPUT_NAME"
+          ls -lh "$OUT_DIR/$OUTPUT_NAME"
 
-        # Copy with KMI-specific naming
-        OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
-        cp kernelsu.ko "$OUT_DIR/$OUTPUT_NAME"
-        
-        echo "Copied to: $OUT_DIR/$OUTPUT_NAME"
-        ls -la "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
-        llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size after stripping: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
+      - name: Upload arm64 kernelsu.ko artifact
+        if: ${{ inputs.arch == 'arm64' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-${{ inputs.kmi }}-lkm
+          path: /github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko
+          if-no-files-found: error
 
-    - name: Upload kernelsu.ko artifact
-      if: ${{ inputs.arch == 'arm64' }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: aarch64-${{ inputs.kmi }}-lkm
-        path: /github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko
+      - name: Build kernelsu.ko for x86_64
+        if: ${{ inputs.arch == 'x86_64' }}
+        env:
+          THOR_PISU_CERT_SIZE: ${{ inputs.thor_pisu_cert_size }}
+          THOR_PISU_CERT_HASH: ${{ inputs.thor_pisu_cert_hash }}
+        run: |
+          set -euo pipefail
+          cd kernel
 
-    - name: Build kernelsu.ko for x64
-      if: ${{ inputs.arch == 'x86_64' }}
-      env:
-        EXPECTED_PR_BUILD_SIZE: ${{ inputs.expected_pr_build_size }}
-        EXPECTED_PR_BUILD_HASH: ${{ inputs.expected_pr_build_hash }}
-      run: |
-        cd kernel
+          mkdir -p /opt/ddk/kdir-x64
+          unset ARCH
+          unset CROSS_COMPILE
+          export ARCH=x86_64
+          kmi=${{ inputs.kmi }}
+          pushd /opt/ddk/src/$kmi
+          export KDIR=/opt/ddk/kdir-x64/$kmi
 
-        echo "=== Preparing KDIR for x64 ==="
+          MODPOST=scripts/mod/modpost.c
+          sed -i -E 's/^([[:space:]]*)check_exports\(mod\);/\1\/\/ check_exports(mod);/' "$MODPOST"
+          sed -i -E 's/^([[:space:]]*)s->module = exp->module;/\1\/\/ s->module = exp->module;/' "$MODPOST"
+          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$MODPOST"
+          sed -i 's/__version_ext_names\") =\n/__version_ext_names\") = \"\"\n/' "$MODPOST"
 
-        mkdir -p /opt/ddk/kdir-x64
-        unset ARCH
-        unset CROSS_COMPILE
-        export ARCH=x86_64
-        kmi=${{ inputs.kmi }}
-        pushd /opt/ddk/src/$kmi
-        export KDIR=/opt/ddk/kdir-x64/$kmi
+          make O=$KDIR gki_defconfig
+          scripts/config --file $KDIR/.config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          if [ "$kmi" == "android16-6.12" ] || [ "$kmi" == "android17-6.18" ]; then
+              scripts/config --file $KDIR/.config -e CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
+          fi
+          make O=$KDIR modules_prepare
+          make O=$KDIR security/selinux/built-in.a
+          popd
 
-        # ddk-min images contain the source tarball, whose modpost patch is
-        # not applied to the fresh x86 kdir.  Keep the patch idempotent so
-        # this also works when the image already contains one or more fixes.
-        MODPOST=scripts/mod/modpost.c
-        sed -i -E 's/^([[:space:]]*)check_exports\(mod\);/\1\/\/ check_exports(mod);/' "$MODPOST"
-        sed -i -E 's/^([[:space:]]*)s->module = exp->module;/\1\/\/ s->module = exp->module;/' "$MODPOST"
-        sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$MODPOST"
-        sed -i 's/__version_ext_names\\") =\\n/__version_ext_names\\") = \\"\\"\\n/' "$MODPOST"
+          MDIR=$(realpath .)
 
-        make O=$KDIR gki_defconfig
-        scripts/config --file $KDIR/.config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
-        if [ "$kmi" == "android16-6.12" ] || [ "$kmi" == "android17-6.18" ]; then
-            scripts/config --file $KDIR/.config -e CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
-        fi
-        make O=$KDIR modules_prepare
-        # Generate SELinux headers through Kbuild in this x86 output tree.
-        make O=$KDIR security/selinux/built-in.a
-        popd
-        
-        echo "=== Building x64 kernelsu.ko for KMI: ${{ inputs.kmi }} ==="
+          if [ "$kmi" == "android17-6.18" ]; then
+            make -C $KDIR M=$MDIR MO=$MDIR compile_commands.json modules               CONFIG_KSU=m               CONFIG_KSU_MULTI_MANAGER_SUPPORT=n               CONFIG_KSU_TRACEPOINT_HOOK=y               CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y               KSU_MANAGER_PACKAGE="com.thor.thor.pisu"               KSU_EXPECTED_SIZE="$THOR_PISU_CERT_SIZE"               KSU_EXPECTED_HASH="$THOR_PISU_CERT_HASH"
+          else
+            make -C $KDIR M=$MDIR src=$MDIR compile_commands.json modules               CONFIG_KSU=m               CONFIG_KSU_MULTI_MANAGER_SUPPORT=n               CONFIG_KSU_TRACEPOINT_HOOK=y               CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y               KSU_MANAGER_PACKAGE="com.thor.thor.pisu"               KSU_EXPECTED_SIZE="$THOR_PISU_CERT_SIZE"               KSU_EXPECTED_HASH="$THOR_PISU_CERT_HASH"
+          fi
 
-        EXTRA_ARGS=""
-        if [ -n "$EXPECTED_PR_BUILD_SIZE" ] && [ -z "$EXPECTED_PR_BUILD_HASH" ]; then
-          echo "ERROR: pr_build_hash must be provided when pr_build_size is set."
-          exit 1
-        fi
-        if [ -z "$EXPECTED_PR_BUILD_SIZE" ] && [ -n "$EXPECTED_PR_BUILD_HASH" ]; then
-          echo "ERROR: pr_build_size must be provided when pr_build_hash is set."
-          exit 1
-        fi
-        if [ -n "$EXPECTED_PR_BUILD_SIZE" ]; then
-          EXTRA_ARGS="KSU_EXPECTED_PR_BUILD_SIZE=$EXPECTED_PR_BUILD_SIZE KSU_EXPECTED_PR_BUILD_HASH=$EXPECTED_PR_BUILD_HASH"
-        fi
-        
-        MDIR=$(realpath .)
+          test -f kernelsu.ko
+          OUT_DIR=/github/workspace/out/x86_64
+          mkdir -p "$OUT_DIR"
+          OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
+          cp kernelsu.ko "$OUT_DIR/$OUTPUT_NAME"
+          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
+          test -s "$OUT_DIR/$OUTPUT_NAME"
+          ls -lh "$OUT_DIR/$OUTPUT_NAME"
 
-        if [ "$kmi" == "android17-6.18" ]; then
-          make -C $KDIR M=$MDIR MO=$MDIR compile_commands.json modules CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y $EXTRA_ARGS
-        else
-          make -C $KDIR M=$MDIR src=$MDIR compile_commands.json modules CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y $EXTRA_ARGS
-        fi
-
-        echo "=== Build completed ==="
-
-        # Create output directory in GitHub workspace
-        OUT_DIR=/github/workspace/out/x86_64
-        mkdir -p $OUT_DIR
-
-        # Copy with KMI-specific naming
-        OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
-        cp kernelsu.ko "$OUT_DIR/$OUTPUT_NAME"
-        
-        echo "Copied to: $OUT_DIR/$OUTPUT_NAME"
-        ls -la "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
-        llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size after stripping: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
-        
-    - name: Upload x64 kernelsu.ko artifact
-      if: ${{ inputs.arch == 'x86_64' }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: x86_64-${{ inputs.kmi }}-lkm
-        path: /github/workspace/out/x86_64/${{ inputs.kmi }}_kernelsu.ko
+      - name: Upload x86_64 kernelsu.ko artifact
+        if: ${{ inputs.arch == 'x86_64' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: x86_64-${{ inputs.kmi }}-lkm
+          path: /github/workspace/out/x86_64/${{ inputs.kmi }}_kernelsu.ko
+          if-no-files-found: error
