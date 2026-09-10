@@ -1,0 +1,169 @@
+name: Build Thor Pisu Manager + LKM
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-thor-pisu.yml'
+      - '.github/workflows/ddk-lkm.yml'
+      - 'manager/**'
+      - 'kernel/**'
+      - 'scripts/extract-cert-hash.sh'
+  pull_request:
+    paths:
+      - '.github/workflows/build-thor-pisu.yml'
+      - '.github/workflows/ddk-lkm.yml'
+      - 'manager/**'
+      - 'kernel/**'
+      - 'scripts/extract-cert-hash.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  build-manager:
+    name: Build and sign Thor Pisu Manager
+    runs-on: ubuntu-latest
+    outputs:
+      apk: ${{ steps.apk.outputs.path }}
+      cert_hash: ${{ steps.cert.outputs.hash }}
+      cert_size: ${{ steps.cert.outputs.size }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate release signing secrets
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_B64: ${{ secrets.THOR_PISU_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.THOR_PISU_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.THOR_PISU_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.THOR_PISU_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" || { echo "::error::THOR_PISU_KEYSTORE_BASE64 is missing"; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo "::error::THOR_PISU_KEYSTORE_PASSWORD is missing"; exit 1; }
+          test -n "$KEY_ALIAS" || { echo "::error::THOR_PISU_KEY_ALIAS is missing"; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "::error::THOR_PISU_KEY_PASSWORD is missing"; exit 1; }
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Prepare release signing
+        if: github.event_name != 'pull_request'
+        working-directory: manager
+        env:
+          KEYSTORE_B64: ${{ secrets.THOR_PISU_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.THOR_PISU_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.THOR_PISU_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.THOR_PISU_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > thor-pisu-release.jks
+          {
+            printf 'KEYSTORE_FILE=%s\n' "$PWD/thor-pisu-release.jks"
+            printf 'KEYSTORE_PASSWORD=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'KEY_ALIAS=%s\n' "$KEY_ALIAS"
+            printf 'KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+          } >> gradle.properties
+
+      - name: Build release APK
+        working-directory: manager
+        env:
+          KSU_MANAGER_PACKAGE: com.thor.thor.pisu
+        run: |
+          set -euo pipefail
+          ./gradlew clean assembleRelease -PKSU_MANAGER_PACKAGE="$KSU_MANAGER_PACKAGE"
+
+      - name: Locate release APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK="$(find manager/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK" || { echo "::error::No release APK was produced"; exit 1; }
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK: $APK"
+
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          APK='${{ steps.apk.outputs.path }}'
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$APKSIGNER" || { echo "::error::apksigner not found"; exit 1; }
+          "$APKSIGNER" verify --verbose "$APK" | tee apksigner-verify.txt
+          grep -q 'Verified using v2 scheme (APK Signature Scheme v2): true' apksigner-verify.txt
+          if grep -q 'Verified using v3 scheme (APK Signature Scheme v3): true' apksigner-verify.txt; then
+            echo "::error::v3 signing is not allowed for this exclusive build"
+            exit 1
+          fi
+
+      - name: Extract Thor Pisu certificate
+        id: cert
+        run: |
+          set -euo pipefail
+          chmod +x scripts/extract-cert-hash.sh
+          scripts/extract-cert-hash.sh '${{ steps.apk.outputs.path }}' kernel/manager/cert_hash.h
+          test -s kernel/manager/cert_hash.h
+
+          HASH="$(sed -n 's/^#define THOR_PISU_CERT_HASH "\(.*\)"/\1/p' kernel/manager/cert_hash.h)"
+          SIZE="$(sed -n 's/^#define THOR_PISU_CERT_SIZE \([0-9][0-9]*\)$/\1/p' kernel/manager/cert_hash.h)"
+
+          test "${#HASH}" -eq 64 || { echo "::error::Invalid certificate hash"; exit 1; }
+          test -n "$SIZE" || { echo "::error::Invalid certificate size"; exit 1; }
+          test "$HASH" != "0000000000000000000000000000000000000000000000000000000000000000" || { echo "::error::Zero certificate hash"; exit 1; }
+
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "Thor Pisu certificate SHA-256: $HASH"
+          echo "Thor Pisu certificate DER size: $SIZE"
+
+      - name: Upload Thor Pisu Manager
+        uses: actions/upload-artifact@v7
+        with:
+          name: ThorPisuManager-release
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload certificate header
+        uses: actions/upload-artifact@v7
+        with:
+          name: thor-pisu-certificate
+          path: kernel/manager/cert_hash.h
+          if-no-files-found: error
+
+  build-lkm:
+    name: Build LKM
+    needs: build-manager
+    if: needs.build-manager.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+        arch:
+          - arm64
+          - x86_64
+    uses: ./.github/workflows/ddk-lkm.yml
+    with:
+      kmi: ${{ matrix.kmi }}
+      arch: ${{ matrix.arch }}
+      thor_pisu_cert_size: ${{ needs.build-manager.outputs.cert_size }}
+      thor_pisu_cert_hash: ${{ needs.build-manager.outputs.cert_hash }}
+      
