@@ -1,12 +1,8 @@
 #!/bin/bash
-# Extract certificate hash from signed APK for exclusive Thor Pisu Manager authorization
-# This script reads the actual signing certificate from the built APK and calculates its SHA-256
+set -euo pipefail
 
-set -e
-
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <apk_path> <output_header>"
-    echo "Example: $0 manager/app/build/outputs/apk/release/ThorPisuManager_*.apk kernel/manager/cert_hash.h"
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <apk_path> <output_header>" >&2
     exit 1
 fi
 
@@ -14,111 +10,167 @@ APK_PATH="$1"
 OUTPUT_HEADER="$2"
 
 if [ ! -f "$APK_PATH" ]; then
-    echo "Error: APK not found at $APK_PATH"
+    echo "Error: APK not found: $APK_PATH" >&2
     exit 1
 fi
 
-# Temporary directory for extraction
-TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
-
-# Extract the central directory offset from EOCD
-cd_offset=$(xxd -l 4 -s $(($(stat -f%z "$APK_PATH" 2>/dev/null || stat -c%s "$APK_PATH") - 22)) "$APK_PATH" | awk '{print $2$3}' | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-cd_offset=$((0x$cd_offset))
-
-# Extract signature block size and find the APK Sig Block 42
-file_size=$(stat -f%z "$APK_PATH" 2>/dev/null || stat -c%s "$APK_PATH")
-sig_block_end=$((file_size - cd_offset - 24))
-
-# Use Python to extract certificate hash
-python3 << 'PYTHON_EOF'
+python3 - "$APK_PATH" "$OUTPUT_HEADER" <<'PYTHON_EOF'
 import sys
 import struct
 import hashlib
+import os
 
 apk_path = sys.argv[1]
 output_header = sys.argv[2]
 
+def u32(data, offset):
+    return struct.unpack_from("<I", data, offset)[0]
+
+def u64(data, offset):
+    return struct.unpack_from("<Q", data, offset)[0]
+
 try:
-    with open(apk_path, 'rb') as f:
-        # Seek to end
+    with open(apk_path, "rb") as f:
         f.seek(0, 2)
         file_size = f.tell()
-        
-        # Find EOCD (End of Central Directory)
-        f.seek(file_size - 22)
-        eocd = f.read(22)
-        cd_offset = struct.unpack('<I', eocd[16:20])[0]
-        
-        # Find APK Sig Block 42
+
+        # Find EOCD.
+        search_size = min(file_size, 65557)
+        f.seek(file_size - search_size)
+        tail = f.read(search_size)
+
+        eocd_pos = tail.rfind(b"PK\x05\x06")
+        if eocd_pos < 0:
+            raise RuntimeError("EOCD record not found")
+
+        cd_offset = u32(tail, eocd_pos + 16)
+
+        if cd_offset < 24:
+            raise RuntimeError("Invalid central directory offset")
+
+        # APK Signing Block footer.
         f.seek(cd_offset - 24)
-        block_data = f.read(24)
-        sig_block_size = struct.unpack('<Q', block_data[0:8])[0]
-        magic = block_data[8:24]
-        
-        if magic != b'APK Sig Block 42':
-            print("Error: Invalid APK signature block", file=sys.stderr)
-            sys.exit(1)
-        
-        # Parse signature block to find v2 signature
-        f.seek(cd_offset - sig_block_size - 8)
-        sig_block = f.read(sig_block_size)
-        
-        # Find ID 0x7109871a (v2 signature)
+        footer = f.read(24)
+
+        if len(footer) != 24:
+            raise RuntimeError("Could not read APK Signing Block footer")
+
+        sig_block_size = u64(footer, 0)
+
+        if footer[8:24] != b"APK Sig Block 42":
+            raise RuntimeError("APK Signing Block 42 not found")
+
+        if sig_block_size < 24:
+            raise RuntimeError("Invalid APK Signing Block size")
+
+        total_size = sig_block_size + 8
+        block_start = cd_offset - total_size
+
+        if block_start < 0:
+            raise RuntimeError("Invalid APK Signing Block start")
+
+        f.seek(block_start)
+        signing_block = f.read(total_size)
+
+        if len(signing_block) != total_size:
+            raise RuntimeError("Incomplete APK Signing Block")
+
+        # Parse ID/value pairs.
         pos = 8
-        while pos < len(sig_block):
-            size = struct.unpack('<Q', sig_block[pos:pos+8])[0]
+        pairs_end = total_size - 24
+        v2_value = None
+
+        while pos < pairs_end:
+            if pos + 8 > pairs_end:
+                raise RuntimeError("Malformed signing block pair")
+
+            pair_size = u64(signing_block, pos)
             pos += 8
-            if pos + 4 > len(sig_block):
+
+            if pair_size < 4 or pos + pair_size > pairs_end:
+                raise RuntimeError("Invalid signing block pair size")
+
+            pair_id = u32(signing_block, pos)
+
+            if pair_id == 0x7109871A:
+                v2_value = signing_block[pos + 4:pos + pair_size]
                 break
-            sig_id = struct.unpack('<I', sig_block[pos:pos+4])[0]
-            pos += 4
-            
-            if sig_id == 0x7109871a:
-                # Found v2 signature, extract certificate
-                # Structure: signers -> first signer -> signed data -> digests -> certificates
-                inner_pos = 0
-                
-                # Skip to certificates section
-                signers_len = struct.unpack('<I', sig_block[pos+inner_pos:pos+inner_pos+4])[0]
-                inner_pos += 4 + signers_len
-                
-                # Read certificates length
-                if pos + inner_pos + 4 <= len(sig_block):
-                    certs_len = struct.unpack('<I', sig_block[pos+inner_pos:pos+inner_pos+4])[0]
-                    inner_pos += 4
-                    
-                    if pos + inner_pos + 4 <= len(sig_block):
-                        cert_size = struct.unpack('<I', sig_block[pos+inner_pos:pos+inner_pos+4])[0]
-                        inner_pos += 4
-                        
-                        if pos + inner_pos + cert_size <= len(sig_block):
-                            cert_data = sig_block[pos+inner_pos:pos+inner_pos+cert_size]
-                            cert_hash = hashlib.sha256(cert_data).hexdigest()
-                            
-                            # Write header
-                            with open(output_header, 'w') as out:
-                                out.write('#ifndef THOR_PISU_CERT_HASH_H\n')
-                                out.write('#define THOR_PISU_CERT_HASH_H\n\n')
-                                out.write(f'#define THOR_PISU_CERT_HASH "{cert_hash}"\n')
-                                out.write(f'#define THOR_PISU_CERT_SIZE {cert_size}\n\n')
-                                out.write('#endif\n')
-                            
-                            print(f"Certificate hash extracted: {cert_hash}")
-                            print(f"Certificate size: {cert_size}")
-                            print(f"Header written to: {output_header}")
-                            sys.exit(0)
-                break
-            else:
-                pos += size
-        
-        print("Error: Could not find v2 signature in APK", file=sys.stderr)
-        sys.exit(1)
+
+            pos += pair_size
+
+        if v2_value is None:
+            raise RuntimeError("APK v2 signature not found")
+
+        # v2 structure:
+        # signers -> signer -> signed-data -> digests -> certificates
+        signers_len = u32(v2_value, 0)
+        signers_start = 4
+        signers_end = signers_start + signers_len
+
+        if signers_end > len(v2_value):
+            raise RuntimeError("Malformed signers sequence")
+
+        signer_len = u32(v2_value, signers_start)
+        signer_start = signers_start + 4
+        signer_end = signer_start + signer_len
+
+        if signer_end > signers_end:
+            raise RuntimeError("Malformed signer")
+
+        signed_data_len = u32(v2_value, signer_start)
+        signed_data_start = signer_start + 4
+        signed_data_end = signed_data_start + signed_data_len
+
+        if signed_data_end > signer_end:
+            raise RuntimeError("Malformed signed-data")
+
+        signed_data = v2_value[signed_data_start:signed_data_end]
+
+        digests_len = u32(signed_data, 0)
+        certs_offset = 4 + digests_len
+
+        certs_len = u32(signed_data, certs_offset)
+        certs_start = certs_offset + 4
+        certs_end = certs_start + certs_len
+
+        if certs_end > len(signed_data):
+            raise RuntimeError("Malformed certificate sequence")
+
+        cert_len = u32(signed_data, certs_start)
+        cert_start = certs_start + 4
+        cert_end = cert_start + cert_len
+
+        if cert_end > certs_end:
+            raise RuntimeError("Malformed certificate")
+
+        cert_data = signed_data[cert_start:cert_end]
+
+        if not cert_data:
+            raise RuntimeError("Empty certificate")
+
+        cert_hash = hashlib.sha256(cert_data).hexdigest()
+        cert_size = len(cert_data)
+
+        if cert_hash == "0" * 64:
+            raise RuntimeError("Zero certificate hash is forbidden")
+
+        os.makedirs(
+            os.path.dirname(os.path.abspath(output_header)),
+            exist_ok=True
+        )
+
+        with open(output_header, "w", encoding="utf-8") as out:
+            out.write("#ifndef THOR_PISU_CERT_HASH_H\n")
+            out.write("#define THOR_PISU_CERT_HASH_H\n\n")
+            out.write(f'#define THOR_PISU_CERT_HASH "{cert_hash}"\n')
+            out.write(f"#define THOR_PISU_CERT_SIZE {cert_size}\n\n")
+            out.write("#endif /* THOR_PISU_CERT_HASH_H */\n")
+
+        print("Certificate SHA-256:", cert_hash)
+        print("Certificate DER size:", cert_size)
+        print("Header written to:", output_header)
 
 except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
+    print("Error:", e, file=sys.stderr)
     sys.exit(1)
-
 PYTHON_EOF
-
-exit $?
